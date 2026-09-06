@@ -86,6 +86,19 @@ jobs:
       - name: Check vendored typeshed stubs are in sync
         run: make check-typeshed
 
+      # rustdoc JSON is nightly-only and format-unstable, so the API reference
+      # is generated with the exact nightly matching monty-apidoc's pinned
+      # `rustdoc-types` (see crates/monty-apidoc/src/main.rs)
+      - name: Install the nightly pinned for rustdoc JSON
+        run: rustup toolchain install nightly-2026-08-31 --profile minimal
+
+      # the pages are not checked in (publish-docs below pushes them to the
+      # `docs-source` branch); this only proves generation still succeeds
+      - name: Generate the Rust API reference
+        run: make generate-api-docs
+
+      - run: cargo test -p monty-apidoc
+
   # The interpreter itself, under every feature config. Each `--features` flag
   # forces a full rebuild of `monty`, so the three configs are kept together
   # here; the crates layered on top run in parallel in `test-rust-crates`.
@@ -189,7 +202,7 @@ jobs:
       # real `monty` binary: build it plainly first (outside the llvm-cov
       # target dir) and point the tests at it explicitly.
       - run: cargo build -p monty-runtime
-      - run: cargo llvm-cov --no-report -p monty-proto -p monty-runtime -p monty-pool
+      - run: cargo llvm-cov --no-report -p monty-proto -p monty-runtime -p monty-pool --features monty-pool/telemetry
         env:
           MONTY_TEST_BIN: ${{ github.workspace }}/target/debug/monty
       - name: Compile Rust documentation examples
@@ -393,12 +406,12 @@ jobs:
       - run: cargo build -p monty-runtime
       - name: Test subprocess crates (Unix)
         if: runner.os != 'Windows'
-        run: cargo test -p monty-proto -p monty-runtime -p monty-pool
+        run: cargo test -p monty-proto -p monty-runtime -p monty-pool --features monty-pool/telemetry
         env:
           MONTY_TEST_BIN: ${{ github.workspace }}/target/debug/monty
       - name: Test subprocess crates (Windows)
         if: runner.os == 'Windows'
-        run: cargo test -p monty-proto -p monty-runtime -p monty-pool
+        run: cargo test -p monty-proto -p monty-runtime -p monty-pool --features monty-pool/telemetry
         env:
           MONTY_TEST_BIN: ${{ github.workspace }}\target\debug\monty.exe
 
@@ -510,6 +523,89 @@ jobs:
         uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe # v1.2.2
         with:
           jobs: ${{ toJSON(needs) }}
+
+  # Publish the docs source read by pydantic/unified-docs: docs/, mkdocs.yml,
+  # the Python package (for the `::: pydantic_monty` autodoc block) and the
+  # generated Rust API reference, as a single-commit orphan `docs-source`
+  # branch. unified-docs clones that branch instead of `main`, so the Rust
+  # pages never need committing here. The docs-update dispatch then rebuilds
+  # the site; with no source pin it resolves monty to the branch tip.
+  publish-docs:
+    needs: [check, inspect-python-assets]
+    if: success() && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    # the branch is force-pushed as a whole, so a slower run for an older
+    # commit must never finish after a newer one
+    concurrency:
+      group: publish-docs
+      cancel-in-progress: true
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      # no release versioning, see https://github.com/dtolnay/rust-toolchain/issues/180
+      - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
+        with:
+          toolchain: stable
+
+      # rustdoc JSON is nightly-only and format-unstable, see the lint job
+      - name: Install the nightly pinned for rustdoc JSON
+        run: rustup toolchain install nightly-2026-08-31 --profile minimal
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          lookup-only: false # zizmor: ignore[cache-poisoning] -- Job does not produce release artifacts; it pushes generated markdown only
+          cache-on-failure: true
+          prefix-key: 'v1-rust'
+
+      - uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57 # v8.0.0
+        with:
+          enable-cache: true # zizmor: ignore[cache-poisoning] -- Job does not produce release artifacts; it pushes generated markdown only
+
+      - name: Generate the Rust API reference
+        run: make generate-api-docs
+
+      - name: Push the docs-source branch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          out="$(mktemp -d)"
+          # keep the same paths as the checkout so unified-docs' sparse list works unchanged
+          for path in docs mkdocs.yml crates/monty-python/python; do
+            mkdir -p "$out/$(dirname "$path")"
+            cp -R "$path" "$out/$path"
+          done
+          cd "$out"
+          git init --initial-branch=docs-source
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit --quiet -m "Docs source for pydantic/monty@${SOURCE_SHA}"
+          git push --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:docs-source
+
+      - name: Generate app token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          client-id: ${{ vars.DOCS_APP_CLIENT_ID }}
+          private-key: ${{ secrets.DOCS_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: unified-docs
+          # repository_dispatch needs contents:write; nothing else is granted
+          permission-contents: write
+
+      - name: Trigger unified-docs deployment
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: gh api repos/pydantic/unified-docs/dispatches --method POST -f event_type=docs-update
 
   # Build source distribution
   build-sdist:
@@ -971,9 +1067,17 @@ jobs:
           - host: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             triple: linux-x64-gnu
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            triple: linux-x64-musl
+            cross-compile: true
           - host: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             triple: linux-arm64-gnu
+          - host: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            triple: linux-arm64-musl
+            cross-compile: true
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -984,6 +1088,17 @@ jobs:
         with:
           toolchain: stable
           targets: ${{ matrix.settings.target }}
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        if: matrix.settings.cross-compile
+        with:
+          version: 0.15.2
+          use-cache: false
+
+      - uses: taiki-e/install-action@1ed3272338f573e042a2e6bca3893aa19f43b47a # v2.71.3
+        if: matrix.settings.cross-compile
+        with:
+          tool: cargo-zigbuild@0.23.3
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -1002,7 +1117,7 @@ jobs:
         working-directory: crates/monty-js
 
       - name: Build the napi shared library
-        run: npx napi build --platform --release --esm --target ${{ matrix.settings.target }}
+        run: npx napi build --platform --release --esm --target ${{ matrix.settings.target }} ${{ matrix.settings.cross-compile && '--cross-compile' || '' }}
         working-directory: crates/monty-js
 
       - name: Upload artifact
@@ -1200,6 +1315,39 @@ jobs:
         run: node package-smoke.mjs
         working-directory: crates/monty-js/smoke-test
 
+  test-js-musl-packages:
+    name: test ${{ matrix.platform.triple }} JS package on node@${{ matrix.node }}
+    needs:
+      - assemble-js-packages
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['20', '24']
+        platform:
+          - os: ubuntu-latest
+            triple: linux-x64-musl
+          - os: ubuntu-24.04-arm
+            triple: linux-arm64-musl
+    runs-on: ${{ matrix.platform.os }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Download package tarballs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: js-package-tarballs
+          path: crates/monty-js/package-tarballs
+
+      - name: Install and run the Alpine package
+        run: |
+          docker run --rm \
+            --volume "${{ github.workspace }}:/workspace" \
+            --workdir /workspace/crates/monty-js/smoke-test \
+            node:${{ matrix.node }}-alpine \
+            sh -c 'npm install ../package-tarballs/monty-main.tgz ../package-tarballs/monty-${{ matrix.platform.triple }}.tgz --force --no-save --no-package-lock && node package-smoke.mjs'
+
   release-js:
     name: Release to NPM
     runs-on: ubuntu-latest
@@ -1207,6 +1355,7 @@ jobs:
       - check
       - test-js
       - test-js-packages
+      - test-js-musl-packages
       - test-browser
       - release-python
     if: success() && (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.run_release))

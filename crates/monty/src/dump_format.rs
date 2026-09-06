@@ -25,8 +25,8 @@ const MAGIC: &[u8; 6] = b"MONTY\0";
 /// Bump this whenever a serialized discriminant can shift, so older dumps are
 /// rejected instead of decoding as their neighbour. That covers the
 /// interpreter's own types *and* everything reachable from [`Dump`] — notably
-/// `TypeCheckingConfig` in `monty-types`.
-pub const DUMP_VERSION: u16 = 6;
+/// [`TypeCheckingConfig`](monty_types::TypeCheckingConfig) in `monty-types`.
+pub const DUMP_VERSION: u16 = 8;
 
 /// Number of bytes before the postcard payload.
 const HEADER_LEN: usize = MAGIC.len() + size_of::<u16>();
@@ -197,7 +197,7 @@ mod tests {
         );
         assert_eq!(
             static_strings_fingerprint(),
-            0xf603_c310_ebed_dcc0,
+            0x782b_66f9_b630_180a,
             "static strings changed for dump version {DUMP_VERSION}"
         );
         assert_eq!(
@@ -215,12 +215,12 @@ mod tests {
 
         assert_eq!(
             variant_order_fingerprint(Type::VARIANTS),
-            0x689e_d8e1_ffb2_3ba1,
+            0xc66d_9014_0335_92be,
             "Type variants changed for dump version {DUMP_VERSION}"
         );
         assert_eq!(
             variant_order_fingerprint(MontyType::VARIANTS),
-            0x9acb_9e35_39c5_7020,
+            0x091c_2e22_e9b8_f5ee,
             "MontyType variants changed for dump version {DUMP_VERSION}"
         );
     }

@@ -85,13 +85,27 @@ interface worker {
         position: u64,
     }
 
-    /// A dataclass value and indexes of its attribute keys and values.
-    record dataclass-node {
+    /// A class type object (`type` is a WIT keyword, hence the name). The
+    /// real class lives on whichever side generated `id`.
+    record class-type-node {
         name: string,
-        type-id: u64,
-        field-names: list<string>,
+        /// Canonical lowercase uuid string.
+        id: string,
+        host-defined: bool,
+        is-dataclass: bool,
+        /// Eagerly-sent class attributes (class constants), as a class value
+        /// or as the class-type of an instance; a non-empty set refreshes the
+        /// sandbox's type object. Empty when the worker sends an instance.
         attrs: list<node-pair>,
-        frozen: bool,
+    }
+
+    /// A class instance and indexes of its attribute keys and values.
+    record class-instance-node {
+        /// Index of this instance's class-type node.
+        class-type: u32,
+        /// Canonical lowercase uuid string.
+        instance-id: string,
+        attrs: list<node-pair>,
     }
 
     /// An external function value.
@@ -133,11 +147,11 @@ interface worker {
         timezone(timezone-node),
         exception(exception-value-node),
         type-name(string),
-        instance-type(string),
+        class-type(class-type-node),
         builtin-function(string),
         path(string),
         file-handle(file-handle-node),
-        dataclass(dataclass-node),
+        class-instance(class-instance-node),
         function(function-node),
         repr(string),
         cycle(cycle-node),
@@ -162,12 +176,14 @@ interface worker {
         value: value,
     }
 
-    /// Resource limits enforced by the sandbox.
+    /// Resource limits. The host enforces `max-suspensions`; the sandbox
+    /// enforces the others.
     record resource-limits {
         max-duration-micros: option<u64>,
         max-memory-bytes: option<u64>,
         gc-interval: option<u64>,
         max-recursion-depth: option<u64>,
+        max-suspensions: option<u64>,
     }
 
     /// Available renderings for type-check diagnostics.
@@ -192,6 +208,9 @@ interface worker {
         assert-message-annotations: option<u32>,
         type-check-format: type-check-format,
         type-check-color: bool,
+        /// How long the child may hold buffered print output. Absent takes its
+        /// default; zero restores line buffering, one event per completed line.
+        print-flush-interval-ms: option<u32>,
     }
 
     /// One Python snippet and its host inputs.
@@ -222,10 +241,14 @@ interface worker {
         outcome: call-result,
     }
 
-    /// The host's answer to an undefined-name suspension.
+    /// The host's answer to an undefined-name suspension: a value, absence
+    /// (NameError / AttributeError in the sandbox), or an exception the host
+    /// raised while resolving it (raised in the sandbox, bypassing
+    /// hasattr()/getattr() defaults).
     variant name-lookup-result {
         value(value),
         undefined,
+        error(raised-error),
     }
 
     /// One settled external future.
@@ -241,6 +264,8 @@ interface worker {
         resume-call(resume-call-request),
         resume-name-lookup(name-lookup-result),
         resume-futures(list<future-result>),
+        /// Raises an error uncatchably at any pending suspension; the session stays usable.
+        abort-feed(raised-error),
         dump,
         load(list<u8>),
         reset,
@@ -273,13 +298,26 @@ interface worker {
         text: string,
     }
 
-    /// A suspended external function call.
+    /// A suspended external function call. When `object-id` is set this is a
+    /// method call on a host-backed object — a class instance, or a class
+    /// type (construction of a host class arrives as a `__call__` call).
     record function-call-event {
         function-name: string,
         args: list<value>,
         kwargs: list<value-pair>,
         call-id: u32,
-        method-call: bool,
+        /// Uuid string of the routed receiver (instance or class type);
+        /// absent for plain external calls.
+        object-id: option<string>,
+    }
+
+    /// A suspended name or lazy-attribute lookup.
+    record name-lookup-event {
+        name: string,
+        /// Set for a lazy attribute lookup on a host-backed object (a class
+        /// instance, or a class type): its uuid string
+        /// (`NameLookup.object_id`).
+        object-id: option<string>,
     }
 
     /// A suspended OS call projected into the public callback shape.
@@ -295,7 +333,7 @@ interface worker {
         print(print-event),
         function-call(function-call-event),
         os-call(os-call-event),
-        name-lookup(string),
+        name-lookup(name-lookup-event),
         resolve-futures(list<u32>),
         complete(value),
         error(raised-exception),
@@ -312,6 +350,9 @@ interface worker {
         status: status,
         /// Buffered prints followed by exactly one turn-ending event.
         events: list<event>,
+        /// The current session's suspension limit. A host uses this after
+        /// `load`, whose dump replaces the configured session limits.
+        max-suspensions: option<u64>,
     }
 
     /// Handles one semantic request using the retained child.

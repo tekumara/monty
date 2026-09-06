@@ -87,10 +87,10 @@ impl PrintWriter<'_> {
         PrintWriter::CollectStreams(buf, Some(DEFAULT_MAX_PRINT_COLLECT_BYTES))
     }
 
-    /// Creates a new `PrintWriter` that reborrows the same underlying target.
+    /// Creates a new [`PrintWriter`] that reborrows the same underlying target.
     ///
     /// This is useful in iterative execution (`start`/`resume` loops) where each
-    /// step takes `PrintWriter` by value but you want all steps to write to the
+    /// step takes [`PrintWriter`] by value but you want all steps to write to the
     /// same output target. The original writer remains valid after the reborrowed
     /// copy is dropped.
     pub fn reborrow(&mut self) -> PrintWriter<'_> {
@@ -143,6 +143,24 @@ impl PrintWriter<'_> {
             }
             Self::CollectStreams(buf, max_bytes) => append_streams_char(buf, PrintStream::Stdout, end, *max_bytes),
             Self::Callback(cb) => cb.stdout_push(end),
+        }
+    }
+
+    /// Whether this writer wants [`poll_flush`](Self::poll_flush) called at all.
+    ///
+    /// Only `Callback` can buffer, so the VM hoists this out of its dispatch
+    /// loop and skips the poll (and its clock read) entirely for every other
+    /// variant.
+    #[must_use]
+    pub fn wants_poll(&self) -> bool {
+        matches!(self, Self::Callback(_))
+    }
+
+    /// Forwards the VM's periodic checkpoint to a buffering callback.
+    pub fn poll_flush(&mut self) -> Result<(), MontyException> {
+        match self {
+            Self::Callback(cb) => cb.poll_flush(),
+            _ => Ok(()),
         }
     }
 }
@@ -230,4 +248,14 @@ pub trait PrintWriterCallback {
     /// # Arguments
     /// * `end` - The character to print after the formatted output.
     fn stdout_push(&mut self, end: char) -> Result<(), MontyException>;
+
+    /// Gives a buffering implementation a chance to release what it holds.
+    ///
+    /// The VM calls this from its periodic dispatch checkpoint, so a callback
+    /// that batches writes can bound how long output sits unsent while the
+    /// program computes without printing. Implementations that write straight
+    /// through do nothing here.
+    fn poll_flush(&mut self) -> Result<(), MontyException> {
+        Ok(())
+    }
 }

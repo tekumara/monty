@@ -747,6 +747,22 @@ try:
 except TypeError as e:
     assert str(e) == "b32decode() missing 1 required positional argument: 's'"
 
+# keyword-only parameters do not widen the positional maximum, and supplying
+# any of them changes how the overflow counts what it was given
+try:
+    base64.a85encode(b'a', True)
+    assert False, 'a85encode() with 2 positionals should raise'
+except TypeError as e:
+    assert str(e) == 'a85encode() takes 1 positional argument but 2 were given'
+
+try:
+    base64.a85encode(b'a', True, foldspaces=True)
+    assert False, 'a85encode() with 2 positionals and a keyword should raise'
+except TypeError as e:
+    assert str(e) == (
+        'a85encode() takes 1 positional argument but 2 positional arguments (and 1 keyword-only argument) were given'
+    )
+
 # =====================================================================
 # === binascii: the C parser families base64's pure Python delegates to ===
 # =====================================================================
@@ -834,3 +850,24 @@ try:
     assert False, 'crc32() with a keyword should raise'
 except TypeError as e:
     assert str(e) == 'binascii.crc32() takes no keyword arguments'
+
+# === check_zero_args: keywords are reported before the positional count ===
+# CPython's `PyArg_NoKeywords` runs first, so a lone keyword never reports
+# `(0 given)`, and a keyword alongside positionals still wins.
+try:
+    datetime.date(2020, 1, 1).isoformat(timespec='minutes')
+    assert False, 'isoformat(timespec=) should raise'
+except TypeError as e:
+    assert str(e) == 'date.isoformat() takes no keyword arguments'
+
+try:
+    datetime.date(2020, 1, 1).isoformat(1, bogus=2)
+    assert False, 'isoformat(1, bogus=) should raise'
+except TypeError as e:
+    assert str(e) == 'date.isoformat() takes no keyword arguments'
+
+try:
+    datetime.date(2020, 1, 1).isoformat(1)
+    assert False, 'isoformat(1) should raise'
+except TypeError as e:
+    assert str(e) == 'date.isoformat() takes no arguments (1 given)'

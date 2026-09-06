@@ -132,11 +132,16 @@ function pushMarked(object: Record<string, unknown>, nodes: ValueNode[]): ValueN
           ...(typeof object.message === 'string' ? { message: object.message } : {}),
         },
       }
-    case 'Dataclass':
-      return pushDataclass(object, nodes)
+    case 'ClassInstance':
+      return pushClassInstance(object, nodes)
     case 'FileHandle':
       return pushFileHandle(object)
     case 'Type':
+      // A class type marker (`classType`) crosses structurally; builtin type
+      // markers carry only the name.
+      if (typeof object.classType === 'object' && object.classType !== null) {
+        return { tag: 'class-type', val: pushClassType(object.classType as Record<string, unknown>, nodes) }
+      }
       return { tag: 'type-name', val: String(object.value) }
     case 'BuiltinFunction':
       return { tag: 'builtin-function', val: String(object.value) }
@@ -162,29 +167,80 @@ function timeZoneFields(
     : {}
 }
 
-/** Validates and converts a host dataclass marker. */
-function pushDataclass(object: Record<string, unknown>, nodes: ValueNode[]): ValueNode {
-  if (typeof object.typeId !== 'bigint') {
+/**
+ * Validates and converts a host `ClassInstance` marker (same shape the napi
+ * path produces: `attrs` as ordered `[name, value]` pairs, uuids as
+ * strings). Validation messages mirror napi's so both transports fail
+ * malformed markers alike.
+ */
+function pushClassInstance(object: Record<string, unknown>, nodes: ValueNode[]): ValueNode {
+  if (typeof object.type !== 'object' || object.type === null) {
     throw new TypeError(
-      `Object property 'typeId' type mismatch. Expect value to be BigInt, but received ${jsType(object.typeId)}`,
+      `Object property 'type' type mismatch. Expect value to be Object, but received ${jsType(object.type)}`,
     )
   }
-  if (!Array.isArray(object.fieldNames)) {
+  if (!Array.isArray(object.attrs)) {
     throw new TypeError(
-      `Object property 'fieldNames' type mismatch. Expect value to be Array, but received ${jsType(object.fieldNames)}`,
+      `Object property 'attrs' type mismatch. Expect value to be Array, but received ${jsType(object.attrs)}`,
     )
   }
-  const fields = (object.fields ?? {}) as Record<string, unknown>
+  const pairs: [unknown, unknown][] = []
+  for (const pair of object.attrs as unknown[]) {
+    if (!Array.isArray(pair)) throw new TypeError('ClassInstance attrs entries must be [name, value] pairs')
+    if (typeof pair[0] !== 'string') throw new TypeError('ClassInstance attr name must be a string')
+    if (!(1 in pair)) throw new TypeError('ClassInstance attr value missing')
+    pairs.push([pair[0], pair[1]])
+  }
+  const classTypeNode = pushClassType(object.type as Record<string, unknown>, nodes)
+  const classTypeIndex = nodes.length
+  nodes.push({ tag: 'class-type', val: classTypeNode })
   return {
-    tag: 'dataclass',
+    tag: 'class-instance',
     val: {
-      name: String(object.name),
-      typeId: object.typeId,
-      fieldNames: object.fieldNames.map(String),
-      attrs: pushPairs(Object.entries(fields), nodes),
-      frozen: Boolean(object.frozen),
+      classType: classTypeIndex,
+      instanceId: uuidString(object.instanceId, 'ClassInstance instanceId'),
+      attrs: pushPairs(pairs, nodes),
     },
   }
+}
+
+/** Builds a class-type node from the plain `classType` marker object,
+ *  appending its eager attr nodes to the arena. */
+function pushClassType(
+  object: Record<string, unknown>,
+  nodes: ValueNode[],
+): Extract<ValueNode, { tag: 'class-type' }>['val'] {
+  // Require an array like the native binding does, so both transports
+  // enforce the same marker contract (a missing `attrs` is a forged or
+  // malformed marker, not an empty attribute list).
+  if (!Array.isArray(object.attrs)) {
+    throw new TypeError('ClassType attrs must be an array of [name, value] pairs')
+  }
+  const attrPairs: [unknown, unknown][] = []
+  for (const pair of object.attrs as unknown[]) {
+    if (!Array.isArray(pair)) throw new TypeError('ClassType attrs entries must be [name, value] pairs')
+    if (typeof pair[0] !== 'string') throw new TypeError('ClassType attr name must be a string')
+    if (!(1 in pair)) throw new TypeError('ClassType attr value missing')
+    attrPairs.push([pair[0], pair[1]])
+  }
+  return {
+    name: String(object.name),
+    id: uuidString(object.id, 'ClassType id'),
+    hostDefined: object.hostDefined === true,
+    isDataclass: object.isDataclass === true,
+    attrs: pushPairs(attrPairs, nodes),
+  }
+}
+
+/** A canonical uuid string is required for identities crossing the wire. */
+function uuidString(value: unknown, what: string): string {
+  if (
+    typeof value !== 'string' ||
+    !/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(value)
+  ) {
+    throw new TypeError(`${what} must be a canonical uuid string`)
+  }
+  return value.toLowerCase()
 }
 
 /** Validates and converts a sandbox file-handle marker. */
@@ -202,6 +258,18 @@ function pushFileHandle(object: Record<string, unknown>): ValueNode {
 /** Appends key/value pairs while preserving their insertion order. */
 function pushPairs(pairs: [unknown, unknown][], nodes: ValueNode[]): NodePair[] {
   return pairs.map(([key, value]) => ({ key: pushValue(key, nodes), value: pushValue(value, nodes) }))
+}
+
+/** Fetches a raw arena node by index with the same bounds/cycle checks as
+ *  `readValue`, for callers that must inspect the node's tag. The index stays
+ *  marked as visiting, so a parent cycle in class-type nodes throws instead
+ *  of recursing forever. */
+function readValueNode(index: number, nodes: ValueNode[], visiting: Set<number>): ValueNode {
+  const node = nodes[index]
+  if (node === undefined) throw new Error(`component value node index ${index} is out of bounds`)
+  if (visiting.has(index)) throw new Error('component value arena contains a cycle')
+  visiting.add(index)
+  return node
 }
 
 /** Reads one arena node recursively, rejecting malformed indexes and cycles. */
@@ -270,8 +338,10 @@ function readValue(index: number, nodes: ValueNode[], visiting: Set<number>): un
       value = { [TYPE_MARKER]: 'Exception', excType: node.val.excType, message: node.val.message ?? '' }
       break
     case 'type-name':
-    case 'instance-type':
       value = { [TYPE_MARKER]: 'Type', value: node.val }
+      break
+    case 'class-type':
+      value = { [TYPE_MARKER]: 'Type', classType: readClassType(node.val, nodes, visiting) }
       break
     case 'builtin-function':
       value = { [TYPE_MARKER]: 'BuiltinFunction', value: node.val }
@@ -286,8 +356,8 @@ function readValue(index: number, nodes: ValueNode[], visiting: Set<number>): un
       }
       value = new MontyFileHandle(node.val.path, node.val.mode, { position: Number(node.val.position) })
       break
-    case 'dataclass':
-      value = readDataclass(node.val, nodes, visiting)
+    case 'class-instance':
+      value = readClassInstance(node.val, nodes, visiting)
       break
     case 'function':
       value = node.val.name
@@ -310,26 +380,53 @@ function readPair(pair: NodePair, nodes: ValueNode[], visiting: Set<number>): [u
   return [readValue(pair.key, nodes, visiting), readValue(pair.value, nodes, visiting)]
 }
 
-/** Rebuilds the public dataclass marker without prototype-setting assignment. */
-function readDataclass(
-  dataclass: Extract<ValueNode, { tag: 'dataclass' }>['val'],
+/**
+ * Rebuilds the public `ClassInstance` marker in the shape the napi path
+ * produces: `attrs` as ordered `[name, value]` pairs (non-string keys
+ * skipped, matching convert.rs) and uuids as strings. The session layer
+ * (`restore`) maps the marker to the original host object or a proxy.
+ */
+function readClassInstance(
+  instance: Extract<ValueNode, { tag: 'class-instance' }>['val'],
   nodes: ValueNode[],
   visiting: Set<number>,
 ): Record<string, unknown> {
-  const fields: Record<string, unknown> = {}
-  for (const pair of dataclass.attrs) {
+  const classNode = readValueNode(instance.classType, nodes, visiting)
+  if (classNode.tag !== 'class-type') {
+    throw new Error("class-instance node's class-type index is not a class-type node")
+  }
+  const attrs: [string, unknown][] = []
+  for (const pair of instance.attrs) {
     const [key, value] = readPair(pair, nodes, visiting)
-    if (typeof key === 'string') {
-      Object.defineProperty(fields, key, { value, enumerable: true, writable: true, configurable: true })
-    }
+    if (typeof key === 'string') attrs.push([key, value])
   }
   return {
-    [TYPE_MARKER]: 'Dataclass',
-    name: dataclass.name,
-    typeId: dataclass.typeId,
-    fieldNames: dataclass.fieldNames,
-    fields,
-    frozen: dataclass.frozen,
+    [TYPE_MARKER]: 'ClassInstance',
+    type: readClassType(classNode.val, nodes, visiting),
+    instanceId: instance.instanceId,
+    attrs,
+  }
+}
+
+/** Rebuilds the plain `classType` marker object from a class-type node,
+ *  resolving its eager attr nodes recursively. */
+function readClassType(
+  classType: Extract<ValueNode, { tag: 'class-type' }>['val'],
+  nodes: ValueNode[],
+  visiting: Set<number>,
+): Record<string, unknown> {
+  const attrs: Array<[string, unknown]> = []
+  for (const pair of classType.attrs) {
+    const [key, value] = readPair(pair, nodes, visiting)
+    // non-string class attr keys are not representable host-side; skip
+    if (typeof key === 'string') attrs.push([key, value])
+  }
+  return {
+    name: classType.name,
+    id: classType.id,
+    hostDefined: classType.hostDefined,
+    isDataclass: classType.isDataclass,
+    attrs,
   }
 }
 

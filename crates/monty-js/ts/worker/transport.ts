@@ -26,12 +26,29 @@ import { decodeValue, encodeValue } from './value.js'
 
 type OnPrint = (stream: 'stdout' | 'stderr', text: string) => void
 
-/** Resource limits enforced inside the worker, mirroring the napi pool's. */
+/**
+ * Encodes a print flush interval (seconds) as whole milliseconds for the WIT
+ * `u32`, mirroring `monty-pool`'s `flush_interval_ms`.
+ *
+ * The component encodes a `u32` as `val >>> 0`, which would silently wrap a
+ * negative or non-finite value into a huge interval, so reject those here.
+ * Zero is the line-buffering sentinel, so a positive interval never rounds
+ * down into it.
+ */
+function flushIntervalMs(interval: number): number {
+  if (!Number.isFinite(interval) || interval < 0) {
+    throw new TypeError(`invalid printFlushInterval: expected a non-negative number of seconds, got ${interval}`)
+  }
+  return interval === 0 ? 0 : Math.min(Math.max(Math.floor(interval * 1000), 1), 0xffffffff)
+}
+
+/** Resource limits mirrored from the napi pool; the transport enforces `maxSuspensions`. */
 export interface ResourceLimits {
   maxDurationSecs?: number
   maxMemory?: number
   gcInterval?: number
   maxRecursionDepth?: number
+  maxSuspensions?: number
 }
 
 /** Session-creation options sent to the component worker. */
@@ -49,6 +66,14 @@ export interface WorkerSessionConfig {
    * child's default, false disables them, and an integer customizes truncation.
    */
   assertMessageAnnotations?: AssertMessageAnnotations
+  /**
+   * How long, in seconds, the worker may hold buffered `print()` output before
+   * sending it (default 0.005). `0` restores line buffering, delivering each
+   * completed line on its own. A turn's frames all reach the host together
+   * here, but this still sets how they are split: one `printCallback` call per
+   * frame, and a print collector charges its `maxBytes` cap per frame.
+   */
+  printFlushInterval?: number
 }
 
 /** A session-shaped adapter over one semantic component dispatcher. */
@@ -62,6 +87,9 @@ export class WorkerTransport {
 
   /** Whether a crash or channel error made this worker unreusable. */
   private dead = false
+
+  private suspensionLimit: bigint | undefined
+  private suspensionsSeen = 0n
 
   /** Reports whether the worker can return to its pool when the session ends. */
   onFinish?: (reusable: boolean) => void
@@ -83,6 +111,9 @@ export class WorkerTransport {
           ...(assertMessageAnnotations === undefined ? {} : { assertMessageAnnotations }),
           typeCheckFormat: componentTypeCheckFormat(config.typeCheckFormat ?? 'full'),
           typeCheckColor: config.typeCheckColor ?? false,
+          ...(config.printFlushInterval === undefined
+            ? {}
+            : { printFlushIntervalMs: flushIntervalMs(config.printFlushInterval) }),
         },
       },
       'ok',
@@ -160,6 +191,16 @@ export class WorkerTransport {
     return this.turn({ tag: 'resume-name-lookup', val: result }, onPrint)
   }
 
+  /** Answers a lazy attribute lookup; a value the arena cannot encode raises `TypeError` in the sandbox. */
+  resumeLazyAttr(value: unknown, onPrint: OnPrint): Promise<NativeTurn> {
+    return this.turn({ tag: 'resume-name-lookup', val: lazyAttrValue(value) }, onPrint)
+  }
+
+  /** Answers a name lookup with an exception raised where it suspended. */
+  resumeNameLookupError(excType: string, message: string, onPrint: OnPrint): Promise<NativeTurn> {
+    return this.turn({ tag: 'resume-name-lookup', val: { tag: 'error', val: { excType, message } } }, onPrint)
+  }
+
   /** Reports the sandbox worker's lack of dependency installation. */
   async installDependencies(requirements: string[], _onPrint: OnPrint): Promise<NativeTurn | { kind: 'ok' }> {
     return requirements.length === 0
@@ -209,7 +250,7 @@ export class WorkerTransport {
     }
     const event = await this.run({ tag: 'load', val: state }, onPrint)
     if (!event) return crashed('worker exited without a turn-ending event')
-    return event.tag === 'ok' ? { kind: 'loaded' } : this.toTurn(event)
+    return event.tag === 'ok' ? { kind: 'loaded' } : this.enforceSuspensionLimit(this.toTurn(event), onPrint)
   }
 
   /** Resets a live worker for reuse and disposes a dead worker. */
@@ -236,6 +277,27 @@ export class WorkerTransport {
   private async turn(request: ComponentRequest, onPrint: OnPrint): Promise<NativeTurn> {
     const event = await this.run(request, onPrint)
     const turn = event ? this.toTurn(event) : crashed('worker exited without a turn-ending event')
+    return this.enforceSuspensionLimit(turn, onPrint)
+  }
+
+  /** Counts a suspension and aborts the feed when it exceeds the session limit. */
+  private async enforceSuspensionLimit(turn: NativeTurn, onPrint: OnPrint): Promise<NativeTurn> {
+    if (isSuspension(turn)) {
+      this.suspensionsSeen += 1n
+      // Abort instead of exposing an over-budget suspension to the host.
+      if (this.suspensionLimit !== undefined && this.suspensionsSeen > this.suspensionLimit) {
+        const message = `suspension limit ${this.suspensionLimit} exceeded`
+        const aborted = await this.run({ tag: 'abort-feed', val: { excType: 'RuntimeError', message } }, onPrint)
+        turn = aborted ? this.toTurn(aborted) : crashed('worker exited without a turn-ending event')
+        // the component answers an abort with an error, never a suspension;
+        // servicing one would let a compromised worker call the host past
+        // the budget, so it ends the worker instead
+        if (turn.kind !== 'error' && turn.kind !== 'crashed') {
+          this.dead = true
+          turn = { kind: 'protocol', message: `worker answered abort-feed with ${turn.kind}` }
+        }
+      }
+    }
     if (turn.kind === 'crashed') this.dead = true
     return turn
   }
@@ -254,6 +316,12 @@ export class WorkerTransport {
     try {
       const result = await this.dispatcher(request)
       if (result.status === 'shutdown') this.dead = true
+      // the component reports the limit in force (the configured one, else
+      // the 1000 default; a dump's on load), so it is adopted from the reply
+      if (request.tag === 'configure' || request.tag === 'load') {
+        this.suspensionLimit = result.maxSuspensions
+        this.suspensionsSeen = 0n
+      }
       events = result.events
     } catch {
       return null
@@ -287,7 +355,8 @@ export class WorkerTransport {
           args: event.val.args.map(decodeValue),
           kwargs: event.val.kwargs.map(({ key, value }) => [decodeValue(key), decodeValue(value)]),
           callId: event.val.callId,
-          methodCall: event.val.methodCall,
+          // null (not undefined) for plain calls, matching the napi turn shape
+          objectId: event.val.objectId ?? null,
         }
       case 'os-call':
         this.pendingCallId = event.val.callId
@@ -300,7 +369,7 @@ export class WorkerTransport {
           callId: event.val.callId,
         }
       case 'name-lookup':
-        return { kind: 'nameLookup', name: event.val }
+        return { kind: 'nameLookup', name: event.val.name, objectId: event.val.objectId ?? null }
       case 'resolve-futures':
         return { kind: 'resolveFutures', pendingCallIds: [...event.val] }
       case 'fatal-error':
@@ -326,7 +395,18 @@ function encodeLimits(limits: ResourceLimits): ComponentResourceLimits {
     ...(limits.maxMemory === undefined ? {} : { maxMemoryBytes: BigInt(limits.maxMemory) }),
     ...(limits.gcInterval === undefined ? {} : { gcInterval: BigInt(limits.gcInterval) }),
     ...(limits.maxRecursionDepth === undefined ? {} : { maxRecursionDepth: BigInt(limits.maxRecursionDepth) }),
+    ...(limits.maxSuspensions === undefined ? {} : { maxSuspensions: BigInt(limits.maxSuspensions) }),
   }
+}
+
+/** Identifies turns that consume the host-side suspension budget. */
+function isSuspension(turn: NativeTurn): boolean {
+  return (
+    turn.kind === 'functionCall' ||
+    turn.kind === 'osCall' ||
+    turn.kind === 'nameLookup' ||
+    turn.kind === 'resolveFutures'
+  )
 }
 
 /** Converts a host return value, turning conversion failures into Python `TypeError`. */
@@ -341,6 +421,18 @@ function returnValue(value: unknown): CallResult {
 /** Creates a traceback-free host exception result. */
 function errorResult(excType: string, message: string): CallResult {
   return { tag: 'error', val: { excType, message } }
+}
+
+/** Converts a lazy attribute's value, turning conversion failures into Python `TypeError`. */
+function lazyAttrValue(value: unknown): NameLookupResult {
+  try {
+    return { tag: 'value', val: encodeValue(value) }
+  } catch (error) {
+    return {
+      tag: 'error',
+      val: { excType: 'TypeError', message: error instanceof Error ? error.message : String(error) },
+    }
+  }
 }
 
 /** Builds the external function value used to answer a name lookup. */
